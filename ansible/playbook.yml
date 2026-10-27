@@ -1,0 +1,132 @@
+---
+- name: Task 1 - NAT on inetRouter
+  hosts: vagrant_boxes
+  become: true
+  tasks:
+
+    # ------------------------------------------------------------------
+    # ЭТАП 1: Глушим cloud-init, чтобы он не перетирал наши конфиги
+    # ВСТАВЛЯТЬ СТРОГО В САМОЕ НАЧАЛО
+    # ------------------------------------------------------------------
+    
+    - name: Disable cloud-init network configuration
+      copy:
+        dest: /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg
+        content: |
+          network: {config: disabled}
+        owner: root
+        group: root
+        mode: '0644'
+      tags:
+        - cloud-init-disable
+      register: ci_disable_result
+
+    - name: Clean cloud-init network cache (автоматически убирает/очищает 50-cloud-init.yaml)
+      command: cloud-init clean -c network
+      changed_when: false
+      tags:
+        - cloud-init-disable
+      when: ci_disable_result.changed or ci_disable_result is succeeded
+
+    # ------------------------------------------------------------------
+
+
+    - name: Set up NAT on inetRouter
+      template:
+        src: "{{ item.src }}"
+        dest: "{{ item.dest }}"
+        owner: root
+        group: root
+        mode: "{{ item.mode }}"
+      loop:
+        - src: "iptables_rules.ipv4"
+          dest: "/etc/iptables_rules.ipv4"
+          mode: "0644"
+      when: inventory_hostname == "inetRouter"
+
+    - name: Create systemd unit for applying NAT rules
+      copy:
+        content: |
+          [Unit]
+          Description=Apply iptables NAT rules
+          After=network.target
+
+          [Service]
+          Type=oneshot
+          ExecStart=/bin/sh -c "/sbin/iptables-restore < /etc/iptables_rules.ipv4"
+          RemainAfterExit=yes
+
+          [Install]
+          WantedBy=multi-user.target
+        dest: /etc/systemd/system/iptables-nat.service
+        owner: root
+        group: root
+        mode: "0644"
+      when: inventory_hostname == "inetRouter"
+
+    - name: Enable and start iptables-nat service
+      systemd:
+        name: iptables-nat
+        enabled: true
+        state: started
+        daemon_reload: true
+      when: inventory_hostname == "inetRouter"
+
+
+- name: Task 2 - IP forwarding on all routers
+  hosts: vagrant_boxes
+  become: true
+  tasks:
+    - name: set up forward packages across routers
+      sysctl:
+        name: net.ipv4.conf.all.forwarding
+        value: '1'
+        state: present
+      when: "'routers' in group_names"
+
+
+- name: Task 3 - Disable default route (except inetRouter)
+  hosts: vagrant_boxes
+  become: true
+  tasks:
+    - name: disable default route
+      template:
+        src: "00-installer-config.yaml"
+        dest: "/etc/netplan/00-installer-config.yaml"
+        owner: root
+        group: root
+        mode: "0644"
+      when: inventory_hostname != "inetRouter"
+
+    # netplan try интерактивен и будет висеть. Для автоматизации используем apply.
+    # Если критично именно try — скажи, но тогда плейбук не пройдёт без ручного подтверждения.
+    - name: apply netplan config
+      command: netplan apply
+      when: inventory_hostname != "inetRouter"
+
+
+- name: Task 5 - Add static routes and reboot
+  hosts: vagrant_boxes
+  become: true
+  tasks:
+    - name: add default gateway and static routes for each host
+      template:
+        src: "50-vagrant_{{ inventory_hostname }}.yaml"
+        dest: "/etc/netplan/50-vagrant.yaml"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: restart all hosts
+      reboot:
+        reboot_timeout: 600
+
+
+- name: Task 6 - Install traceroute
+  hosts: vagrant_boxes
+  become: true
+  tasks:
+    - name: Install traceroute
+      apt:
+        name: traceroute
+        state: present
